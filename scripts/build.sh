@@ -7,7 +7,6 @@ export LD_LIBRARY_PATH="${LIBGCC_DIR}:${LD_LIBRARY_PATH:-}"
 export LIBRARY_PATH="${LIBGCC_DIR}:${LIBRARY_PATH:-}"
 
 mkdir -p target/bindgen
-mkdir -p src/js
 mkdir -p dist
 
 cargo build --target wasm32-unknown-unknown --release
@@ -16,7 +15,7 @@ wasm-bindgen \
     --target web \
     --no-typescript \
     --out-dir target/bindgen \
-    target/wasm32-unknown-unknown/release/paradise_push_crypto.wasm
+    target/wasm32-unknown-unknown/release/paradise_matrix_push_crypto.wasm
 
 WASM_FEATURES=(
     --enable-bulk-memory
@@ -27,12 +26,12 @@ WASM_FEATURES=(
 )
 
 wasm-opt -Oz "${WASM_FEATURES[@]}" \
-         target/bindgen/paradise_push_crypto_bg.wasm \
-         -o target/bindgen/paradise_push_crypto_opt.wasm
+         target/bindgen/paradise_matrix_push_crypto_bg.wasm \
+         -o target/bindgen/paradise_matrix_push_crypto_opt.wasm
 
 wasm2js -Oz "${WASM_FEATURES[@]}" \
-        target/bindgen/paradise_push_crypto_opt.wasm \
-        -o src/js/paradise_push_crypto_asm.js
+        target/bindgen/paradise_matrix_push_crypto_opt.wasm \
+        -o target/bindgen/paradise_matrix_push_crypto_asm.js
 
 {
   sed 's/__ nativeGetRandomBytes/__nativeGetRandomBytes/g' src/js/jsc_shim.js
@@ -49,7 +48,7 @@ EOF
     -e 's/^export default .*//' \
     -e 's/cachedUint8ArrayMemory0\.byteLength === 0/cachedUint8ArrayMemory0.buffer !== wasm.memory.buffer/g' \
     -e 's/cachedDataViewMemory0\.buffer\.detached === true/cachedDataViewMemory0.buffer !== wasm.memory.buffer/g' \
-    target/bindgen/paradise_push_crypto.js
+    target/bindgen/paradise_matrix_push_crypto.js
 
   cat << 'EOF'
   function __instantiate_asm(__wbg_imports) {
@@ -58,7 +57,7 @@ EOF
   sed -E \
     -e 's#^import \* as ([A-Za-z0-9_$]+) from [\x27"]([^\x27"]+)[\x27"];?#const \1 = __wbg_imports["\2"] || Object.values(__wbg_imports)[0];#' \
     -e 's/^export var .*//' \
-    src/js/paradise_push_crypto_asm.js
+    target/bindgen/paradise_matrix_push_crypto_asm.js
 
   cat << 'EOF'
     return retasmFunc;
@@ -79,7 +78,18 @@ EOF
   };
 })(typeof globalThis !== "undefined" ? globalThis : this);
 EOF
-} > dist/paradise_push_crypto_bundle.js
+} > dist/paradise_matrix_push_crypto_bundle.js
 
-ls -lh dist/paradise_push_crypto_bundle.js
+node -e '
+  const fs = require("fs");
+  const raw = fs.readFileSync("dist/paradise_matrix_push_crypto_bundle.js", "utf8");
+  const cjs = [
+    "require(\"./paradise_matrix_push_crypto_bundle.js\");",
+    "exports.BUNDLE_SOURCE = " + JSON.stringify(raw) + ";",
+    "exports.ParadisePushCrypto = globalThis.ParadisePushCrypto;"
+  ].join("\n");
+  fs.writeFileSync("dist/index.js", cjs);
+'
+
+ls -lh dist/paradise_matrix_push_crypto_bundle.js dist/index.js
 
