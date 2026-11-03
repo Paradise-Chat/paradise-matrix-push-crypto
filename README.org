@@ -1,0 +1,443 @@
+#+TITLE: Paradise Push Crypto
+#+AUTHOR: G
+#+STARTUP: overview
+
+* Overview
+
+This repository produces a self-contained, zero-Wasm JavaScript bundle designed
+to execute inside minimal embedded JS runtimes such as JavaScriptCore
+(=JSContext= on iOS) or QuickJS (on Android).
+
+Because Paradise is a protocol-agnostic client where protocols are loaded
+dynamically as engines, background push notification decryption cannot hardcode
+protocol-specific native cryptography into the host application binary. By
+compiling the Rust cryptography stack into WebAssembly and transpiling it down
+to standard JavaScript via =wasm2js=, the Paradise core application can
+dynamically evaluate engine-provided encryption handlers at runtime inside a
+Notification Service Extension while remaining strictly within both OS memory
+limits and App Store regulatory compliance.
+
+As long as the host application does not dynamically load native machine code
+(such as unverified Swift, Objective-C, C, or Kotlin binaries) at runtime or
+expose native platform APIs to guest scripts, evaluating self-contained
+JavaScript inside the system runtime is fully compliant with
+platform guidelines (such as App Store Review Guidelines 2.5.2 and 4.7.2).
+Furthermore, this bundle does not introduce or change any application
+features or functionality beyond what is already strictly defined by the
+native Swift or Kotlin host extension. The native Notification Service
+Extension owns the entire execution lifecycle, storage, and OS
+notification presentation, invoking the JS bundle solely as a stateless,
+sandboxed codec (ciphertext and state pickles in, plaintext and updated
+pickles out) with zero access to native OS frameworks, networking, or the filesystem.
+
+This crate is built as a dependency for the Matrix engine
+(wrapping =vodozemac= for Olm and Megolm operations) and is served to the
+Paradise core application by the engine.
+
+* Architecture & Rationale
+
+** Why =wasm2js= Instead of Native WebAssembly?
+
+Mobile background push execution environments operate under severe platform constraints:
+
+1. *App Store & OS Entitlements*: iOS Notification Service Extensions
+   (=UNNotificationServiceExtension=) execute in a restricted sandbox without
+   JIT compilation entitlements, and bare =JSContext= instances do not expose
+   the =WebAssembly= global API when JIT is disabled.
+2. *Strict Memory Ceilings*: iOS enforces a hard ~24 MB memory limit on
+   Notification Service Extensions. Instantiating a full WebView (=WKWebView=)
+   to gain WebAssembly support easily exceeds this ceiling and causes the OS to
+   terminate the extension before decryption completes. Personal testing showed
+   a bit more wiggle room.
+3. *WebView Storage Isolation*: Because the primary Paradise client executes
+   inside a WebView container, its Matrix cryptographic store resides inside the
+   WebView's sandboxed origin storage (=IndexedDB= via =WKWebsiteDataStore=) rather
+   than a shared native SQLite file. A background notification extension cannot
+   read or mutate the WebView's internal database directly.
+
+To solve this, =paradise-push-crypto= compiles =vodozemac= to
+=wasm32-unknown-unknown=, generates bindings with =wasm-bindgen=, and lowers
+the resulting =.wasm= binary into pure JavaScript via Binaryen's =wasm2js=.
+Every function across the boundary is strictly stateless: cryptographic state
+(Olm accounts, Olm sessions, and Megolm inbound group sessions) is passed in
+and returned as serialized JSON pickles that the host persists in keychain or
+encrypted storage.
+
+** The Shadow Account Model
+
+Rather than duplicating the primary client device identity, the push decryption
+pipeline provisions a dedicated *Shadow Device* on the Matrix homeserver:
+
+- The shadow device generates its own Curve25519 identity key, Ed25519 signing
+  key, and pool of signed One-Time Keys (OTKs).
+- Using the user's Self-Signing Key (SSK) seed, the shadow device cross-signs
+  its own =device_keys= payload so other devices in the room automatically trust
+  it and forward Megolm room keys (=m.room_key=) to it via Olm.
+- When push notifications arrive, the background extension wakes up, unpickles
+  the shadow account or session inside QuickJS/JSC, decrypts the to-device Olm
+  payload to extract the =m.room_key=, persists the newly created Megolm
+  inbound group session pickle, and decrypts the room event ciphertext.
+
+* Host Environment & Polyfill Contract
+
+Because bare =JSContext= and QuickJS environments only implement core ECMAScript
+standards and omit Web Platform APIs, the bundle prepends =src/js/jsc_shim.js=
+to provide minimal, memory-safe polyfills required by =wasm-bindgen= and Rust's
+=getrandom=:
+
+- =console=: Stubs =log=, =warn=, and =error= as no-ops if absent.
+- =TextEncoder=: Implements UTF-16 (including surrogate pairs) to UTF-8 encoding,
+  including =encodeInto= to write directly into the simulated Wasm linear memory
+  =Uint8Array= without intermediate buffer allocations.
+- =TextDecoder=: Implements UTF-8 decoding with 4096-codepoint batch flushing via
+  =String.fromCodePoint.apply= to stay well beneath JavaScriptCore's 65,536
+  function argument limit.
+- =crypto.getRandomValues=: Delegates entropy generation to a mandatory native
+  host callback.
+
+** Required Host Bridge: =__nativeGetRandomBytes=
+
+Before invoking any function that generates cryptographic keys
+(=create_shadow_account= or =replenish_one_time_keys=), the host environment
+*must* register a synchronous function on =globalThis= named
+=__nativeGetRandomBytes(byteLength)= backed by the platform CSPRNG
+(=SecRandomCopyBytes= on iOS or =SecureRandom= on Android).
+
+#+begin_src javascript
+globalThis.__nativeGetRandomBytes = function (byteLength) {
+  return nativeCsprngBridge(byteLength);
+};
+#+end_src
+
+If =__nativeGetRandomBytes= is not registered when Rust requests entropy,
+=crypto.getRandomValues= throws a fatal error rather than falling back
+to insecure PRNGs.
+
+* API Reference
+
+When evaluated, the bundle attaches its API to =globalThis.ParadisePushCrypto=.
+All methods accept strings or numbers and return a JSON-encoded string
+(or throw a JS error on failure).
+
+** 1. =create_shadow_account=
+
+Provisions a new Matrix Olm =Account= for the shadow push device, generates an
+initial batch of signed One-Time Keys, and optionally cross-signs the device
+keys using the user's Self-Signing Key (SSK).
+
+*Signature:*
+#+begin_src typescript
+create_shadow_account(
+  user_id: string,
+  device_id: string,
+  otk_count: number,
+  ssk_seed_base64?: string | null
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "account_pickle": "<serialized AccountPickle JSON string>",
+  "curve25519_key": "<base64 Curve25519 public key>",
+  "ed25519_key": "<base64 Ed25519 public key>",
+  "upload_payload": {
+    "device_keys": {
+      "algorithms": [
+        "m.olm.v1.curve25519-aes-sha2",
+        "m.megolm.v1.aes-sha2"
+      ],
+      "device_id": "SHADOWDEV1",
+      "keys": {
+        "curve25519:SHADOWDEV1": "<base64>",
+        "ed25519:SHADOWDEV1": "<base64>"
+      },
+      "signatures": {
+        "@user:example.org": {
+          "ed25519:SHADOWDEV1": "<base64 device self-signature>",
+          "ed25519:<ssk_pub_base64>": "<base64 SSK cross-signature>"
+        }
+      },
+      "user_id": "@user:example.org"
+    },
+    "one_time_keys": {
+      "signed_curve25519:<key_id>": {
+        "key": "<base64>",
+        "signatures": {
+          "@user:example.org": {
+            "ed25519:SHADOWDEV1": "<base64>"
+          }
+        }
+      }
+    }
+  },
+  "signature_upload_payload": {
+    "@user:example.org": {
+      "SHADOWDEV1": { }
+    }
+  }
+}
+#+end_src
+
+** 2. =sign_shadow_device_with_ssk=
+
+Retroactively signs an existing pickled shadow account's =device_keys= with the
+user's Self-Signing Key (SSK) seed, producing a payload ready for
+=/_matrix/client/v3/keys/signatures/upload=.
+
+*Signature:*
+#+begin_src typescript
+sign_shadow_device_with_ssk(
+  account_pickle_json: string,
+  user_id: string,
+  device_id: string,
+  ssk_seed_base64: string
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "@user:example.org": {
+    "SHADOWDEV1": {
+      "algorithms": [
+        "m.olm.v1.curve25519-aes-sha2",
+        "m.megolm.v1.aes-sha2"
+      ],
+      "device_id": "SHADOWDEV1",
+      "keys": {
+        "curve25519:SHADOWDEV1": "<base64>",
+        "ed25519:SHADOWDEV1": "<base64>"
+      },
+      "signatures": {
+        "@user:example.org": {
+          "ed25519:SHADOWDEV1": "<base64>",
+          "ed25519:<ssk_pub_base64>": "<base64>"
+        }
+      },
+      "user_id": "@user:example.org"
+    }
+  }
+}
+#+end_src
+
+** 3. =replenish_one_time_keys=
+
+Unpickles the shadow account, generates =count= new One-Time Keys, signs them
+with the shadow device's Ed25519 key, marks them as published, and returns the
+updated account pickle alongside the =/keys/upload= payload.
+
+*Signature:*
+#+begin_src typescript
+replenish_one_time_keys(
+  account_pickle_json: string,
+  user_id: string,
+  device_id: string,
+  count: number
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "account_pickle": "<updated AccountPickle JSON string>",
+  "one_time_keys": {
+    "signed_curve25519:<key_id>": {
+      "key": "<base64>",
+      "signatures": {
+        "@user:example.org": {
+          "ed25519:SHADOWDEV1": "<base64>"
+        }
+      }
+    }
+  }
+}
+#+end_src
+
+** 4. =decrypt_olm_prekey_with_account=
+
+Establishes a new inbound Olm session from an incoming Type 0 (=PreKey=) Olm
+message using the shadow account pickle, consumes the corresponding One-Time Key,
+and decrypts the message. Both the returned =session_pickle= and the mutated
+=account_pickle= must be persisted by the caller.
+
+*Signature:*
+#+begin_src typescript
+decrypt_olm_prekey_with_account(
+  account_pickle_json: string,
+  sender_curve25519_key: string,
+  ciphertext_base64: string
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "plaintext": "<UTF-8 decrypted Olm payload>",
+  "session_pickle": "<serialized SessionPickle JSON string>",
+  "account_pickle": "<updated AccountPickle JSON string>"
+}
+#+end_src
+
+** 5. =decrypt_olm_with_session=
+
+Decrypts an incoming Olm message
+(=message_type= =0= for =PreKey= or =1= for =Normal=)
+against an existing pickled Olm =Session= and returns the ratcheted session
+pickle.
+
+*Signature:*
+#+begin_src typescript
+decrypt_olm_with_session(
+  session_pickle_json: string,
+  message_type: number,
+  ciphertext_base64: string
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "plaintext": "<UTF-8 decrypted Olm payload>",
+  "session_pickle": "<updated SessionPickle JSON string>"
+}
+#+end_src
+
+** 6. =create_inbound_group_session=
+
+Initializes a Megolm v1 =InboundGroupSession= from a raw Base64 =m.room_key=
+session key (typically extracted from a decrypted to-device Olm event) and returns its serialized pickle.
+
+*Signature:*
+#+begin_src typescript
+create_inbound_group_session(
+  session_key_base64: string
+): string
+#+end_src
+
+*Returns:*
+A JSON string representing the serialized =InboundGroupSessionPickle=.
+
+** 7. =import_exported_group_session=
+
+Initializes a Megolm v1 =InboundGroupSession= from an exported session key
+(such as keys retrieved from encrypted key backup or room key forwarding)
+and returns its serialized pickle.
+
+*Signature:*
+#+begin_src typescript
+import_exported_group_session(
+  exported_key_base64: string
+): string
+#+end_src
+
+*Returns:*
+A JSON string representing the serialized =InboundGroupSessionPickle=.
+
+** 8. =decrypt_megolm=
+
+Decrypts an =m.room.encrypted= Megolm event ciphertext using a pickled
+=InboundGroupSession= and returns the plaintext event JSON, the ratchet
+=message_index=, and the updated session pickle.
+
+*Signature:*
+#+begin_src typescript
+decrypt_megolm(
+  session_pickle_json: string,
+  ciphertext_base64: string
+): string
+#+end_src
+
+*Returns (JSON string):*
+#+begin_src json
+{
+  "plaintext": "{\"type\":\"m.room.message\",\"content\":{\"body\":\"Push works!\"}}",
+  "message_index": 0,
+  "session_pickle": "<updated InboundGroupSessionPickle JSON string>"
+}
+#+end_src
+
+* Building & Testing
+
+Development and builds can be run inside an isolated, FHS-emulated GNU Guix
+container (personal choice) using the repository manifest:
+
+#+begin_src sh
+guix shell -C -N -F --share=$HOME -m ./manifest.scm
+sh ./scripts/rust-install.sh
+#+end_src
+
+=scripts/rust-install.sh= provisions the Rust =1.93.0= toolchain,
+the =wasm32-unknown-unknown= target, and =wasm-bindgen-cli= (=0.2.114=),
+resolving =libgcc_s.so.1= paths automatically for prebuilt Cargo/Rustup binaries
+inside the container.
+
+** Compilation & Bundling
+
+#+begin_src sh
+sh ./scripts/build.sh
+#+end_src
+
+Running =./scripts/build.sh= compiles the crate to =wasm32-unknown-unknown=,
+generates bindings via =wasm-bindgen=, optimizes for size with =wasm-opt -Oz=,
+lowers the Wasm binary to pure JavaScript via Binaryen's =wasm2js -Oz=, and
+amalgamates =src/js/jsc_shim.js=, the =wasm-bindgen= glue, and the =wasm2js= output
+into a single self-executing bundle at =dist/paradise_push_crypto_bundle.js=.
+
+During bundling, =build.sh= also patches =wasm-bindgen='s memory view invalidation
+checks (=cachedUint8ArrayMemory0= and =cachedDataViewMemory0=) to
+compare =buffer !== wasm.memory.buffer=. Unlike native WebAssembly,
+=wasm2js= simulates =memory.grow()= by allocating and reassigning a new =ArrayBuffer=
+without detaching or zeroing out the old buffer, so comparing buffer identity
+directly prevents stale memory views when the heap grows.
+
+
+** End-to-End Verification
+
+#+begin_src sh
+sh ./scripts/test.sh
+#+end_src
+
+Running =./scripts/test.sh= builds the bundle and executes the test suite
+in =src/lib.rs= (=test_wasm2js_bundle_end_to_end=), which loads
+=dist/paradise_push_crypto_bundle.js= into a stripped Node.js environment
+(with =WebAssembly=, =TextEncoder=, =TextDecoder=, and =crypto= deleted from =globalThis=)
+and verifies full interoperability against native =vodozemac=: shadow account
+creation, device self-signature and SSK cross-signature verification, OTK
+replenishment, inbound Olm =PreKey= and =Normal= session decryption, and Megolm
+decryption from both live and exported session keys.
+
+* References & Further Reading
+
+** Apple Platform & App Store Guidelines
+- [[https://developer.apple.com/app-store/review/guidelines/#software-requirements][App Store Review Guidelines - Section 2.5.2 (Software Requirements & Executable Code)]]
+- [[https://developer.apple.com/app-store/review/guidelines/#design][App Store Review Guidelines - Section 4.7 (Mini apps, mini games, streaming games, chatbots, plug-ins, and game emulators)]]
+- [[https://developer.apple.com/documentation/usernotifications/unnotificationserviceextension][Apple Developer Documentation: UNNotificationServiceExtension]]
+- [[https://developer.apple.com/documentation/javascriptcore/jscontext][Apple Developer Documentation: JavaScriptCore / JSContext]]
+- [[https://developer.apple.com/documentation/security/1399291-secrandomcopybytes][Apple Developer Documentation: SecRandomCopyBytes]]
+- [[https://www.technetexperts.com/guideline-4-2-minimum-functionality/][Minimum Functionality for Submission]]
+
+** Extension Memory Limits (24 MB Ceiling)
+- [[https://stackoverflow.com/questions/50764003/what-memory-limit-for-apple-notifications-service-extension][iOS Notification Extension StackOverflow]]
+
+** Mobile WebViews
+- [[https://developer.apple.com/documentation/webkit/wkwebview][Apple Developer Documentation: WKWebView]]
+- [[https://developer.android.com/reference/android/webkit/WebView][Android Developer Reference: android.webkit.WebView]]
+
+** Vodozemac Cryptography
+- [[https://matrix-org.github.io/vodozemac/vodozemac/index.html][vodozemac Rust Documentation (Olm, Megolm, and Pickling)]]
+- [[https://matrix-org.github.io/vodozemac/vodozemac/olm/index.html][vodozemac::olm Module Documentation]]
+- [[https://matrix-org.github.io/vodozemac/vodozemac/megolm/index.html][vodozemac::megolm Module Documentation]]
+
+** Matrix Protocol Specifications
+- [[https://spec.matrix.org/latest/client-server-api/#end-to-end-encryption][Matrix Client-Server API: End-to-End Encryption]]
+- [[https://spec.matrix.org/latest/client-server-api/#cross-signing][Matrix Client-Server API: Cross-Signing]]
+- [[https://spec.matrix.org/latest/client-server-api/#push-notifications][Matrix Client-Server API: Push Notifications]]
+- [[https://spec.matrix.org/latest/push-gateway-api/][Matrix Push Gateway API Specification]]
+- [[https://spec.matrix.org/v1.19/olm-megolm/][Matrix Olm & Megolm]]
+
+** Compilation & Runtime Tooling
+- [[https://github.com/WebAssembly/binaryen][Binaryen Toolchain (wasm2js Compiler)]]
+- [[https://github.com/wasm-bindgen/wasm-bindgen][wasm-bindgen Repository]]
+- [[https://wasm-bindgen.github.io/wasm-bindgen/][The wasm-bindgen Guide]]
+- [[https://bellard.org/quickjs/][QuickJS JavaScript Engine]]
