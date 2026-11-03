@@ -1,0 +1,22 @@
+[package]
+name = "paradise-push-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vodozemac = { version = "0.8", default-features = false, features = ["low-level-api"] }
+wasm-bindgen = "=0.2.114"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
