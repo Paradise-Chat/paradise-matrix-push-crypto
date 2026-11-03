@@ -1,4 +1,4 @@
-#+TITLE: Paradise Push Crypto
+#+TITLE: Paradise Matrix Push Crypto
 #+AUTHOR: G
 #+STARTUP: overview
 
