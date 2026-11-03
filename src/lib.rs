@@ -488,7 +488,7 @@ mod tests {
                 return Uint8Array.from(cryptoNode.randomBytes(count));
             };
 
-            require("./dist/paradise_push_crypto_bundle.js");
+            require("./dist/paradise_matrix_push_crypto_bundle.js");
             const api = globalThis.ParadisePushCrypto;
 
             const [
