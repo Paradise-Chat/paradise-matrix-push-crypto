@@ -391,6 +391,9 @@ compare =buffer !== wasm.memory.buffer=. Unlike native WebAssembly,
 without detaching or zeroing out the old buffer, so comparing buffer identity
 directly prevents stale memory views when the heap grows.
 
+One last note, but the bundle is then packaged and published on npm:
+https://www.npmjs.com/package/paradise-matrix-push-crypto
+
 
 ** End-to-End Verification
 
