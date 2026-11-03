@@ -1,0 +1,16 @@
+{
+    "name": "paradise-matrix-push-crypto",
+    "version": "0.1.0",
+    "description": "Stateless Olm and Megolm push decryption bundle (wasm2js) for the Paradise Matrix engine",
+    "main": "dist/paradise_matrix_push_crypto_bundle.js",
+    "files": [
+        "dist/paradise_matrix_push_crypto_bundle.js",
+        "README.org"
+    ],
+    "scripts": {
+        "build": "sh ./scripts/build.sh",
+        "test": "sh ./scripts/test.sh",
+        "prepack": "sh ./scripts/build.sh"
+    },
+    "packageManager": "pnpm@10.28.0+sha512.05df71d1421f21399e053fde567cea34d446fa02c76571441bfc1c7956e98e363088982d940465fd34480d4d90a0668bc12362f8aa88000a64e83d0b0e47be48"
+}
