@@ -13,6 +13,7 @@
    "yarn"
    "git"
    "bash"
+   "pnpm"
    "sed"
    "nss-certs"
    "coreutils"))
