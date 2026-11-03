@@ -1,3 +1,5 @@
 .cargo/*
 .projectile
 src/js/paradise_push_crypto_asm.js
+target/*
+dist/*
